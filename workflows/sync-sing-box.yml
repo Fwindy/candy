@@ -1,0 +1,281 @@
+name: Sync sing-box to GHCR
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天 UTC 00:00 检查一次
+    - cron: "0 0 * * *"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: sync-sing-box
+  cancel-in-progress: false
+
+env:
+  SOURCE_IMAGE: ghcr.io/sagernet/sing-box:latest
+  TARGET_IMAGE: ghcr.io/fwindy/candy:latest
+  VERSION_LABEL: org.opencontainers.image.version
+  REGCTL_VERSION: v0.11.7
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq curl
+
+          curl -fsSL \
+            "https://github.com/regclient/regclient/releases/download/${REGCTL_VERSION}/regctl-linux-amd64" \
+            -o /tmp/regctl
+
+          sudo install -m 755 /tmp/regctl /usr/local/bin/regctl
+
+          regctl version
+          skopeo --version
+          jq --version
+
+      - name: Check version, sync and clean metadata
+        shell: bash
+        env:
+          GH_USER: ${{ github.repository_owner }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          VERSION_KEY="${VERSION_LABEL}"
+
+          echo "Checking upstream: ${SOURCE_IMAGE}"
+
+          # 使用 linux/amd64 平台读取上游版本
+          SOURCE_VERSION="$(
+            skopeo inspect \
+              --override-os linux \
+              --override-arch amd64 \
+              --format "{{ index .Labels \"${VERSION_KEY}\" }}" \
+              "docker://${SOURCE_IMAGE}"
+          )"
+
+          if [ -z "${SOURCE_VERSION}" ] || [ "${SOURCE_VERSION}" = "<no value>" ]; then
+            echo "ERROR: Upstream version Label is missing."
+            exit 1
+          fi
+
+          echo "Upstream version: ${SOURCE_VERSION}"
+
+          # 登录 GHCR
+          printf '%s' "${GH_TOKEN}" |
+            regctl registry login ghcr.io \
+              --user "${GH_USER}" \
+              --pass-stdin
+
+          # 读取目标镜像版本；目标不存在时按首次同步处理
+          TARGET_VERSION="$(
+            skopeo inspect \
+              --override-os linux \
+              --override-arch amd64 \
+              --creds "${GH_USER}:${GH_TOKEN}" \
+              --format "{{ index .Labels \"${VERSION_KEY}\" }}" \
+              "docker://${TARGET_IMAGE}" 2>/dev/null || true
+          )"
+
+          echo "Target version: ${TARGET_VERSION:-<missing>}"
+
+          # 版本一致，完全跳过
+          if [ -n "${TARGET_VERSION}" ] && \
+             [ "${SOURCE_VERSION}" = "${TARGET_VERSION}" ]; then
+            echo "Same version. Skip syncing."
+            exit 0
+          fi
+
+          echo "Version changed or target missing. Starting synchronization."
+
+          # 复制所有架构
+          skopeo copy --all --preserve-digests \
+            --dest-creds "${GH_USER}:${GH_TOKEN}" \
+            "docker://${SOURCE_IMAGE}" \
+            "docker://${TARGET_IMAGE}"
+
+          echo "Image copied successfully."
+
+          # ==========================================
+          # 自动收集并清理 Labels / Annotations
+          # ==========================================
+
+          echo "Collecting metadata keys..."
+
+          ROOT_JSON="$(regctl manifest get \
+            "${TARGET_IMAGE}" \
+            --format raw-body)"
+
+          : > /tmp/label-keys
+          : > /tmp/annotation-keys
+
+          # 收集顶层 Index / Manifest Annotations
+          printf '%s' "${ROOT_JSON}" |
+            jq -r '(.annotations // {}) | keys[]?' \
+            >> /tmp/annotation-keys
+
+          # 获取 Index 中的所有实际平台
+          mapfile -t PLATFORMS < <(
+            printf '%s' "${ROOT_JSON}" |
+              jq -r '
+                .manifests[]?
+                | select(.platform.os? != null)
+                | select(.platform.architecture? != null)
+                | select(.platform.os != "unknown")
+                | select(.platform.architecture != "unknown")
+                | .platform as $p
+                | if ($p.variant // "") == "" then
+                    "\($p.os)/\($p.architecture)"
+                  else
+                    "\($p.os)/\($p.architecture)/\($p.variant)"
+                  end
+              ' | sort -u
+          )
+
+          if [ "${#PLATFORMS[@]}" -eq 0 ]; then
+            echo "ERROR: No platform manifests found in the image index."
+            exit 1
+          fi
+
+          echo "Platforms:"
+          printf '  %s\n' "${PLATFORMS[@]}"
+
+          # 逐个平台收集 Config Labels 和 Manifest Annotations
+          for PLATFORM in "${PLATFORMS[@]}"; do
+            echo "Inspecting ${PLATFORM}..."
+
+            LABEL_JSON="$(regctl image inspect \
+              "${TARGET_IMAGE}" \
+              --platform "${PLATFORM}" \
+              --format '{{json .Config.Labels}}')"
+
+            printf '%s' "${LABEL_JSON}" |
+              jq -r '
+                if type == "object" then keys[]
+                else empty
+                end
+              ' >> /tmp/label-keys
+
+            MANIFEST_JSON="$(regctl manifest get \
+              "${TARGET_IMAGE}" \
+              --platform "${PLATFORM}" \
+              --format raw-body)"
+
+            printf '%s' "${MANIFEST_JSON}" |
+              jq -r '(.annotations // {}) | keys[]?' \
+              >> /tmp/annotation-keys
+          done
+
+          # 去重并生成修改参数
+          mapfile -t LABEL_KEYS < <(sort -u /tmp/label-keys)
+          mapfile -t ANNOTATION_KEYS < <(sort -u /tmp/annotation-keys)
+
+          ARGS=()
+
+          # 删除除 version 以外的全部 Labels
+          for KEY in "${LABEL_KEYS[@]}"; do
+            [ "${KEY}" = "${VERSION_KEY}" ] && continue
+
+            echo "Remove Label: ${KEY}"
+            ARGS+=(--label "[*]${KEY}")
+          done
+
+          # 删除除 version 以外的全部 Index / Manifest Annotations
+          for KEY in "${ANNOTATION_KEYS[@]}"; do
+            [ "${KEY}" = "${VERSION_KEY}" ] && continue
+
+            echo "Remove Annotation: ${KEY}"
+            ARGS+=(--annotation "[*]${KEY}")
+          done
+
+          # 修改并覆盖目标 Tag
+          if [ "${#ARGS[@]}" -gt 0 ]; then
+            regctl image mod "${TARGET_IMAGE}" \
+              "${ARGS[@]}" \
+              --replace
+          else
+            echo "No metadata needs cleaning."
+          fi
+
+          echo "Metadata cleanup completed."
+
+          # ==========================================
+          # 验证清理结果
+          # ==========================================
+
+          echo "Verifying final image..."
+
+          ROOT_AFTER="$(regctl manifest get \
+            "${TARGET_IMAGE}" \
+            --format raw-body)"
+
+          # 检查顶层 Annotations
+          printf '%s' "${ROOT_AFTER}" |
+            jq -e --arg keep "${VERSION_KEY}" '
+              [
+                (.annotations // {})
+                | keys[]
+                | select(. != $keep)
+              ] | length == 0
+            ' >/dev/null
+
+          for PLATFORM in "${PLATFORMS[@]}"; do
+            # 检查 Labels 是否只剩 version
+            LABEL_JSON="$(regctl image inspect \
+              "${TARGET_IMAGE}" \
+              --platform "${PLATFORM}" \
+              --format '{{json .Config.Labels}}')"
+
+            printf '%s' "${LABEL_JSON}" |
+              jq -e --arg keep "${VERSION_KEY}" '
+                [
+                  if type == "object" then keys[]
+                  else empty
+                  end
+                  | select(. != $keep)
+                ] | length == 0
+              ' >/dev/null
+
+            # 确认版本 Label 没有丢失或变化
+            FINAL_VERSION="$(
+              printf '%s' "${LABEL_JSON}" |
+                jq -r --arg key "${VERSION_KEY}" '.[$key] // empty'
+            )"
+
+            if [ "${FINAL_VERSION}" != "${SOURCE_VERSION}" ]; then
+              echo "ERROR: Version mismatch on ${PLATFORM}."
+              echo "Expected: ${SOURCE_VERSION}"
+              echo "Actual: ${FINAL_VERSION}"
+              exit 1
+            fi
+
+            # 检查平台 Manifest Annotations
+            MANIFEST_JSON="$(regctl manifest get \
+              "${TARGET_IMAGE}" \
+              --platform "${PLATFORM}" \
+              --format raw-body)"
+
+            printf '%s' "${MANIFEST_JSON}" |
+              jq -e --arg keep "${VERSION_KEY}" '
+                [
+                  (.annotations // {})
+                  | keys[]
+                  | select(. != $keep)
+                ] | length == 0
+              ' >/dev/null
+          done
+
+          echo "All checks passed."
+          echo "Final image: ${TARGET_IMAGE}"
+          echo "Final version: ${SOURCE_VERSION}"
